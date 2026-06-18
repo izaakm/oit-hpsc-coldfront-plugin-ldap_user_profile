@@ -14,10 +14,10 @@ from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
-from coldfront_plugin_ldap_export.models import LDAPHost, LDAPUserProfile
+from coldfront.plugins.ldap_user_profile.models import LDAPHost, LDAPUserProfile
 
 # Import your existing client
-from coldfront_plugin_ldap_export.ldap_client import ISAACLDAP
+from coldfront.plugins.ldap_user_profile.ldap_client import ISAACLDAP
 
 logger = logging.getLogger(__name__)
 
