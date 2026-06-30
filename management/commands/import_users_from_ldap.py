@@ -225,6 +225,8 @@ class Command(BaseCommand):
     def _fetch_entries(self, client, search_base, search_filter):
         """Search LDAP and return a list of attribute dicts."""
         if self.verbosity >= 2:
+            # self.stdout.write(f"  Client:        {client}")  # Not helpful, just object id.
+            self.stdout.write(f"  Connection:    {client.connection}")
             self.stdout.write(f"  Search base:   {search_base}")
             self.stdout.write(f"  Search filter: {search_filter}")
             self.stdout.write(f"  Attributes:    {self.LDAP_ATTRIBUTES}\n")
@@ -236,6 +238,7 @@ class Command(BaseCommand):
                 size_limit=0,
                 attributes=self.LDAP_ATTRIBUTES,
             )
+            print(conn.entries)
             # Each entry's .entry_attributes_as_dict gives us
             # {'uid': ['jmill165'], 'uidNumber': [9540], ...}
             entries = [
