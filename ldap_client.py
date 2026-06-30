@@ -83,7 +83,8 @@ class LDAPClient:
             user=self.user,
             password=self.password,
             auto_bind=False,
-            client_strategy="SAFE_SYNC", # wait for response, thread-safe
+            # client_strategy="SAFE_SYNC", # wait for response, thread-safe  ~> NOT WORKING????
+            client_strategy="SYNC", # works .... why???
             read_only=read_only,
             lazy=lazy                    # open and bind the connection only when an operation is performed
         )
