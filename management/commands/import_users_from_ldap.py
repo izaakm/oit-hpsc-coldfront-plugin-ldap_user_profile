@@ -1,4 +1,6 @@
 """
+coldfront/plugins/ldap_user_profile/management/commands/import_users_from_ldap.py
+
 Usage:
     python manage.py import_users_from_ldap
     python manage.py import_users_from_ldap --dry-run
@@ -238,135 +240,143 @@ class Command(BaseCommand):
                 size_limit=0,
                 attributes=self.LDAP_ATTRIBUTES,
             )
-            print(conn.entries)
-            # Each entry's .entry_attributes_as_dict gives us
-            # {'uid': ['jmill165'], 'uidNumber': [9540], ...}
+            # conn.entries is only valid inside the context manager,
+            # so materialise everything into plain dicts now.
             entries = [
                 entry.entry_attributes_as_dict
                 for entry in conn.entries
             ]
 
+        if self.verbosity >= 2:
+            self.stdout.write(f"  Raw entries returned: {len(entries)}")
+
         return entries
 
     # ──────────────────────────────────────────────────────────
-    # Process a single LDAP entry
+    # Process one LDAP entry → Django/ColdFront/LDAP models
     # ──────────────────────────────────────────────────────────
 
-    def _process_entry(self, entry, options):
-        """Create or update Django User + LDAPUserProfile from one LDAP entry.
+    @transaction.atomic
+    def _process_entry(self, entry_dict, options):
+        """Create or update the three models for one LDAP user.
+
+        Creates:
+          1. Django User          (username, first_name, last_name, email)
+          2. ColdFront UserProfile (is_pi — defaults to False)
+          3. LDAPUserProfile      (all POSIX/LDAP fields)
+          4. LDAPHost M2M links
 
         Returns one of: 'created', 'updated', 'skipped'.
         """
-        # --- Extract attributes ---
-        username = _first(entry.get("uid"))
+        # --- Extract fields from the LDAP attribute dict ---
+        username = _first(entry_dict.get("uid"))
         if not username:
-            if self.verbosity >= 1:
-                self.stdout.write(self.style.WARNING("  SKIP: entry with no uid"))
+            self.stderr.write(self.style.WARNING(
+                "  SKIP: entry has no uid attribute"
+            ))
             return "skipped"
 
-        uid_number = _first_int(entry.get("uidNumber"))
-        if not uid_number:
-            if self.verbosity >= 1:
-                self.stdout.write(self.style.WARNING(f"  SKIP [{username}]: no uidNumber"))
-            return "skipped"
+        # Name: prefer givenName for first name, fall back to cn
+        first_name = (
+            _first(entry_dict.get("givenName"))
+            or _first(entry_dict.get("cn"))
+        )
+        last_name = _first(entry_dict.get("sn"))
+        email = _first(entry_dict.get("mail"))
 
-        # Name fields: LDAP is inconsistent about givenName vs. cn.
-        # 'cn' is often the full name, 'givenName' is the first name.
-        # Fall back gracefully.
-        first_name = _first(entry.get("givenName")) or _first(entry.get("cn", ""))
-        last_name = _first(entry.get("sn", ""))
-        email = _first(entry.get("mail", ""))
+        uid_number = _first_int(entry_dict.get("uidNumber"))
+        gid_number = _first_int(entry_dict.get("gidNumber"))
+        home_directory = _first(entry_dict.get("homeDirectory"))
+        login_shell = _first(entry_dict.get("loginShell"), "/bin/bash")
+        gecos = _first(entry_dict.get("gecos"))
 
-        gid_number = _first_int(entry.get("gidNumber"), default=uid_number)
-        home_directory = _first(entry.get("homeDirectory", ""))
-        login_shell = _first(entry.get("loginShell"), default="/bin/bash")
-        gecos = _first(entry.get("gecos", ""))
+        shadow_last_change = _first_int(
+            entry_dict.get("shadowLastChange"), 0
+        )
+        shadow_max = _first_int(entry_dict.get("shadowMax"), 99999)
+        shadow_warning = _first_int(entry_dict.get("shadowWarning"), 7)
 
-        shadow_last_change = _first_int(entry.get("shadowLastChange"), default=0)
-        shadow_max = _first_int(entry.get("shadowMax"), default=99999)
-        shadow_warning = _first_int(entry.get("shadowWarning"), default=7)
-
-        # host is multi-valued: ['isaac', 'all', 'login', ...]
-        host_names = entry.get("host", [])
-        if not isinstance(host_names, list):
-            host_names = [host_names] if host_names else []
-
-        # userPassword comes back as bytes or a base64 string.
-        # Store it as-is for LDAP export; we don't need to parse it.
-        raw_password = _first(entry.get("userPassword", ""))
-        if isinstance(raw_password, bytes):
-            ldap_password = raw_password.decode("utf-8", errors="replace")
+        # userPassword comes as bytes from ldap3
+        raw_pw = _first(entry_dict.get("userPassword"), "")
+        if isinstance(raw_pw, bytes):
+            # Store the base64 representation of the hashed password
+            import base64
+            ldap_password = base64.b64encode(raw_pw).decode("ascii")
         else:
-            ldap_password = str(raw_password) if raw_password else ""
+            ldap_password = str(raw_pw)
 
-        # --- Log what we found ---
+        # host is multi-valued
+        host_names = entry_dict.get("host", [])
+        if isinstance(host_names, str):
+            host_names = [host_names]
+
         if self.verbosity >= 2:
-            self.stdout.write(f"  Processing: {username} (uid={uid_number}, gid={gid_number})")
+            self.stdout.write(f"  Processing: {username} "
+                              f"(uid={uid_number}, gid={gid_number})")
 
         if self.dry_run:
-            action = "created" if not User.objects.filter(username=username).exists() else "updated"
-            label = self.style.SUCCESS(f"  [DRY RUN] Would {action}: {username}")
-            self.stdout.write(label)
-            return action
+            self.stdout.write(f"  [DRY RUN] Would import: {username} "
+                              f"({first_name} {last_name}, {email})")
+            return "created"  # count it for reporting purposes
 
-        # --- Write to database (all-or-nothing per user) ---
-        with transaction.atomic():
-            # 1) Django User
-            user, user_created = User.objects.update_or_create(
-                username=username,
-                defaults={
-                    "first_name": first_name[:30],   # Django User.first_name max_length=30 (150 in 4.x)
-                    "last_name": last_name[:150],
-                    "email": email[:254],
-                },
-            )
+        # ── 1. Django User ──────────────────────────────────
+        user, user_created = User.objects.update_or_create(
+            username=username,
+            defaults={
+                "first_name": first_name[:30],   # Django's max_length=30 (pre-4.x) or 150
+                "last_name": last_name[:150],
+                "email": email[:254] if email else "",
+            },
+        )
 
-            if user_created and options.get("set_unusable_password", True):
-                user.set_unusable_password()
-                user.save(update_fields=["password"])
+        if user_created and options.get("set_unusable_password", True):
+            user.set_unusable_password()
+            user.save(update_fields=["password"])
 
-            # 2) ColdFront UserProfile
-            #    The post_save signal in coldfront.core.user.signals should
-            #    auto-create this, but be defensive in case it didn't fire
-            #    (e.g., bulk import before signals were connected).
-            from coldfront.core.user.models import UserProfile
-            UserProfile.objects.get_or_create(user=user)
+        # ── 2. ColdFront UserProfile ────────────────────────
+        # Explicitly create it — do NOT rely on the post_save signal,
+        # which may not fire depending on app loading order or if
+        # update_or_create hit the "update" path.
+        UserProfile.objects.get_or_create(
+            user=user,
+            defaults={"is_pi": False},
+        )
 
-            # 3) LDAPUserProfile
-            ldap_profile, profile_created = LDAPUserProfile.objects.update_or_create(
-                user=user,
-                defaults={
-                    "uid_number": uid_number,
-                    "gid_number": gid_number,
-                    "home_directory": home_directory,
-                    "login_shell": login_shell,
-                    "gecos": gecos,
-                    "shadow_last_change": shadow_last_change,
-                    "shadow_max": shadow_max,
-                    "shadow_warning": shadow_warning,
-                    "ldap_password": ldap_password,
-                },
-            )
+        # ── 3. LDAPUserProfile ──────────────────────────────
+        ldap_profile, ldap_created = LDAPUserProfile.objects.update_or_create(
+            user=user,
+            defaults={
+                "uid_number": uid_number,
+                "gid_number": gid_number,
+                "home_directory": home_directory,
+                "login_shell": login_shell,
+                "gecos": gecos,
+                "shadow_last_change": shadow_last_change,
+                "shadow_max": shadow_max,
+                "shadow_warning": shadow_warning,
+                "ldap_password": ldap_password,
+            },
+        )
 
-            # 4) Host entries (M2M)
-            if host_names:
-                host_objects = []
-                for hname in host_names:
-                    hname = str(hname).strip()
-                    if hname:
-                        host_obj, _ = LDAPHost.objects.get_or_create(name=hname)
-                        host_objects.append(host_obj)
-                # .set() replaces the entire M2M relationship — idempotent.
-                ldap_profile.hosts.set(host_objects)
+        # ── 4. Host M2M ────────────────────────────────────
+        if host_names:
+            host_objects = []
+            for hname in host_names:
+                hname = str(hname).strip()
+                if hname:
+                    host_obj, _ = LDAPHost.objects.get_or_create(name=hname)
+                    host_objects.append(host_obj)
+            # .set() replaces existing M2M links (idempotent)
+            ldap_profile.hosts.set(host_objects)
 
-        # --- Report ---
         action = "created" if user_created else "updated"
+
         if self.verbosity >= 1:
-            host_str = ", ".join(str(h) for h in host_names) if host_names else "(none)"
             symbol = "+" if user_created else "~"
             self.stdout.write(
-                f"  [{symbol}] {username:20s}  uid={uid_number:<6d}  "
-                f"gid={gid_number:<6d}  hosts=[{host_str}]"
+                f"  [{symbol}] {username:<20s}  "
+                f"uid={uid_number}  gid={gid_number}  "
+                f"hosts={[h.name for h in ldap_profile.hosts.all()]}"
             )
 
         return action
