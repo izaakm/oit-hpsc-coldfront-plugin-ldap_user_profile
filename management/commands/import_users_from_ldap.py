@@ -17,6 +17,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
 from coldfront.plugins.ldap_user_profile.models import LDAPHost, LDAPUserProfile
+from coldfront.core.user.models import UserProfile
 
 # Import your existing client
 from coldfront.plugins.ldap_user_profile.ldap_client import ISAACLDAP
