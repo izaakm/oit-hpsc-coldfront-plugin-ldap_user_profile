@@ -55,4 +55,32 @@ LDAP_SEARCH_BASE = "dc=hpsc,dc=tennessee,dc=edu"
 Solution: Run `migrate` commands.
 
 
+## Issue [IN PROGRESS]
+
+`import_users_from_ldap` seems to work (`1 Created...`), but you can't see
+those users in the admin page of the web app.
+
+Doing `initial_setup` fails ('no such table'...), which can be 'fixed' by
+running `python manage.py {makemigrations, migrate}`, but this(?) causes to
+databases to be created: one in the directory where you ran `initial_setup` and
+one where you ran `python manage.py ...`. Furthermore, you need to run `python
+manage.py import_users_from_ldap` in the coldfront repo. So some combination of
+these things causes the ldap users to be added to a separate database from the
+one that the coldfront web app sees.
+
+**Current solution:**
+Be sure to set the path to the database in the config, e.g., in
+`local_settings.py`:
+
+```python
+import os
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'coldfront.db'),
+    }
+}
+```
+
+Probably need to fix this so that everything is handled cleanly in setup
 
